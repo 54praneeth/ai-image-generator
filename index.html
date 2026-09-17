@@ -3,12 +3,14 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta name="color-scheme" content="light" />
 <title>AI Image Studio</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
   :root {
+    color-scheme: light;
     --bg: #ffffff;
     --ink: #0a0a0a;
     --muted: #6e6e6e;
@@ -215,7 +217,12 @@
     border-radius: 2px;
     border: 1px solid var(--line);
     background: var(--bg);
+    color: var(--ink);
     font-family: inherit;
+  }
+  select option {
+    background: var(--bg);
+    color: var(--ink);
   }
   .btn {
     padding: 10px 16px;
@@ -285,7 +292,7 @@
       </div>
 
       <div class="chips" id="chips"></div>
-      <p class="hint">Free, no sign-up — images are generated live by a public AI model (Pollinations.ai).</p>
+      <p class="hint">Free to use — images are generated live by AI.</p>
     </section>
 
     <section id="genScreen" class="hidden">
@@ -322,7 +329,7 @@
         </div>
       </div>
 
-      <div class="source-line" id="sourceLine">Powered by <a href="https://pollinations.ai" target="_blank" rel="noopener">Pollinations.ai</a></div>
+      <div class="source-line" id="sourceLine"></div>
     </section>
 
     <div id="errorBox" class="error-box hidden"></div>
@@ -392,6 +399,7 @@
   const downloadBtn = document.getElementById('downloadBtn');
   const anotherBtn = document.getElementById('anotherBtn');
   const regenBtn = document.getElementById('regenBtn');
+  const sourceLine = document.getElementById('sourceLine');
 
   let runId = 0;
   let lastPrompt = '';
@@ -491,6 +499,53 @@
       url: `https://image.pollinations.ai/prompt/${encodeURIComponent(fullPrompt)}?${params.toString()}`,
       size,
     };
+  }
+
+  // Primary image backend: Hugging Face Inference Providers, running the
+  // (free, ungated) Qwen/Qwen-Image model. This needs a personal access
+  // token scoped to "Inference Providers" — see the comment on HF_TOKEN
+  // below for how to get one. Falls back to Pollinations.ai automatically
+  // (see startGeneration) if no token is set or the call fails for any
+  // reason (rate limit, cold start timeout, network error, etc).
+  //
+  // Get a free token: huggingface.co/settings/tokens -> "Create new token"
+  // -> "Fine-grained" -> enable only "Make calls to Inference Providers".
+  const HF_TOKEN = "REPLACE_WITH_YOUR_HF_TOKEN";
+
+  let hfClientPromise = null;
+  function getHfClient() {
+    if (!hfClientPromise) {
+      hfClientPromise = import('https://esm.sh/@huggingface/inference').then(
+        mod => new mod.InferenceClient(HF_TOKEN)
+      );
+    }
+    return hfClientPromise;
+  }
+
+  function withTimeout(promise, timeoutMs) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('timeout')), timeoutMs);
+      promise.then(
+        v => { clearTimeout(timer); resolve(v); },
+        e => { clearTimeout(timer); reject(e); }
+      );
+    });
+  }
+
+  async function generateWithHf(prompt, styleIdx, sizeIdx, seed, timeoutMs) {
+    if (!HF_TOKEN || HF_TOKEN.startsWith('REPLACE_')) throw new Error('no token configured');
+    const style = STYLES[styleIdx] || STYLES[0];
+    const size = SIZES[sizeIdx] || SIZES[0];
+    const client = await getHfClient();
+    const blob = await withTimeout(
+      client.textToImage({
+        model: 'Qwen/Qwen-Image',
+        inputs: prompt + style.suffix,
+        parameters: { width: size.w, height: size.h, seed },
+      }),
+      timeoutMs
+    );
+    return { url: URL.createObjectURL(blob), size, isBlob: true };
   }
 
   function loadImage(url, timeoutMs) {
@@ -677,7 +732,8 @@
     const styleIdx = Number(styleSelect.value || 0);
     const sizeIdx = Number(sizeSelect.value || 0);
     const seed = Math.floor(Math.random() * 1e9);
-    const { url, size } = buildImageUrl(prompt, styleIdx, sizeIdx, seed);
+    const fallback = buildImageUrl(prompt, styleIdx, sizeIdx, seed);
+    const size = fallback.size;
 
     promptScreen.classList.add('hidden');
     genScreen.classList.remove('hidden');
@@ -696,22 +752,29 @@
     const stopGenAnim = startGenAnimation(myRunId, previewW, previewH);
 
     let img;
+    let source = 'pollinations';
     try {
-      img = await loadImage(url, 90000);
-    } catch (err) {
-      stopGenAnim();
-      if (myRunId === runId) {
-        showError(
-          err.message === 'timeout'
-            ? "The AI is taking too long to respond. Please try again."
-            : "The AI couldn't generate that image. Please try a different prompt."
-        );
-        genScreen.classList.add('hidden');
-        promptScreen.classList.remove('hidden');
+      const hf = await generateWithHf(prompt, styleIdx, sizeIdx, seed, 45000);
+      img = await loadImage(hf.url, 15000);
+      source = 'hf';
+    } catch (hfErr) {
+      try {
+        img = await loadImage(fallback.url, 90000);
+      } catch (err) {
+        stopGenAnim();
+        if (myRunId === runId) {
+          showError(
+            err.message === 'timeout'
+              ? "The AI is taking too long to respond. Please try again."
+              : "The AI couldn't generate that image. Please try a different prompt."
+          );
+          genScreen.classList.add('hidden');
+          promptScreen.classList.remove('hidden');
+        }
+        submitBtn.disabled = false;
+        regenBtn.disabled = false;
+        return;
       }
-      submitBtn.disabled = false;
-      regenBtn.disabled = false;
-      return;
     }
 
     stopGenAnim();
@@ -720,6 +783,9 @@
     submitBtn.disabled = false;
     regenBtn.disabled = false;
     statusLine.textContent = 'Painting it onto the canvas…';
+    sourceLine.innerHTML = source === 'hf'
+      ? 'Powered by <a href="https://huggingface.co/Qwen/Qwen-Image" target="_blank" rel="noopener">Hugging Face (Qwen-Image)</a>'
+      : 'Powered by <a href="https://pollinations.ai" target="_blank" rel="noopener">Pollinations.ai</a>';
 
     await paint(img, myRunId);
     if (myRunId === runId) {
