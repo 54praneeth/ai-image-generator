@@ -501,53 +501,6 @@
     };
   }
 
-  // Primary image backend: Hugging Face Inference Providers, running the
-  // (free, ungated) Qwen/Qwen-Image model. This needs a personal access
-  // token scoped to "Inference Providers" — see the comment on HF_TOKEN
-  // below for how to get one. Falls back to Pollinations.ai automatically
-  // (see startGeneration) if no token is set or the call fails for any
-  // reason (rate limit, cold start timeout, network error, etc).
-  //
-  // Get a free token: huggingface.co/settings/tokens -> "Create new token"
-  // -> "Fine-grained" -> enable only "Make calls to Inference Providers".
-  const HF_TOKEN = "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";
-
-  let hfClientPromise = null;
-  function getHfClient() {
-    if (!hfClientPromise) {
-      hfClientPromise = import('https://esm.sh/@huggingface/inference').then(
-        mod => new mod.InferenceClient(HF_TOKEN)
-      );
-    }
-    return hfClientPromise;
-  }
-
-  function withTimeout(promise, timeoutMs) {
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('timeout')), timeoutMs);
-      promise.then(
-        v => { clearTimeout(timer); resolve(v); },
-        e => { clearTimeout(timer); reject(e); }
-      );
-    });
-  }
-
-  async function generateWithHf(prompt, styleIdx, sizeIdx, seed, timeoutMs) {
-    if (!HF_TOKEN || HF_TOKEN.startsWith('REPLACE_')) throw new Error('no token configured');
-    const style = STYLES[styleIdx] || STYLES[0];
-    const size = SIZES[sizeIdx] || SIZES[0];
-    const client = await getHfClient();
-    const blob = await withTimeout(
-      client.textToImage({
-        model: 'Qwen/Qwen-Image',
-        inputs: prompt + style.suffix,
-        parameters: { width: size.w, height: size.h, seed },
-      }),
-      timeoutMs
-    );
-    return { url: URL.createObjectURL(blob), size, isBlob: true };
-  }
-
   function loadImage(url, timeoutMs) {
     // Note: deliberately NOT setting img.crossOrigin here. Pollinations.ai's
     // bot-protection rejects anonymous/CORS-mode image requests, but allows
@@ -732,8 +685,7 @@
     const styleIdx = Number(styleSelect.value || 0);
     const sizeIdx = Number(sizeSelect.value || 0);
     const seed = Math.floor(Math.random() * 1e9);
-    const fallback = buildImageUrl(prompt, styleIdx, sizeIdx, seed);
-    const size = fallback.size;
+    const { url, size } = buildImageUrl(prompt, styleIdx, sizeIdx, seed);
 
     promptScreen.classList.add('hidden');
     genScreen.classList.remove('hidden');
@@ -741,6 +693,7 @@
     promptTitleEl.textContent = '"' + prompt + '"';
     statusLine.textContent = 'The AI is generating your image…';
     setProgress(0, 'Contacting the AI…');
+    sourceLine.innerHTML = 'Powered by <a href="https://pollinations.ai" target="_blank" rel="noopener">Pollinations.ai</a>';
 
     // Fit the preview canvas to the target image's aspect ratio.
     const maxW = Math.min(900, canvasWrapper.clientWidth || 860, window.innerWidth - 60);
@@ -752,29 +705,22 @@
     const stopGenAnim = startGenAnimation(myRunId, previewW, previewH);
 
     let img;
-    let source = 'pollinations';
     try {
-      const hf = await generateWithHf(prompt, styleIdx, sizeIdx, seed, 45000);
-      img = await loadImage(hf.url, 15000);
-      source = 'hf';
-    } catch (hfErr) {
-      try {
-        img = await loadImage(fallback.url, 90000);
-      } catch (err) {
-        stopGenAnim();
-        if (myRunId === runId) {
-          showError(
-            err.message === 'timeout'
-              ? "The AI is taking too long to respond. Please try again."
-              : "The AI couldn't generate that image. Please try a different prompt."
-          );
-          genScreen.classList.add('hidden');
-          promptScreen.classList.remove('hidden');
-        }
-        submitBtn.disabled = false;
-        regenBtn.disabled = false;
-        return;
+      img = await loadImage(url, 90000);
+    } catch (err) {
+      stopGenAnim();
+      if (myRunId === runId) {
+        showError(
+          err.message === 'timeout'
+            ? "The AI is taking too long to respond. Please try again."
+            : "The AI couldn't generate that image. Please try a different prompt."
+        );
+        genScreen.classList.add('hidden');
+        promptScreen.classList.remove('hidden');
       }
+      submitBtn.disabled = false;
+      regenBtn.disabled = false;
+      return;
     }
 
     stopGenAnim();
@@ -783,9 +729,6 @@
     submitBtn.disabled = false;
     regenBtn.disabled = false;
     statusLine.textContent = 'Painting it onto the canvas…';
-    sourceLine.innerHTML = source === 'hf'
-      ? 'Powered by <a href="https://huggingface.co/Qwen/Qwen-Image" target="_blank" rel="noopener">Hugging Face (Qwen-Image)</a>'
-      : 'Powered by <a href="https://pollinations.ai" target="_blank" rel="noopener">Pollinations.ai</a>';
 
     await paint(img, myRunId);
     if (myRunId === runId) {
