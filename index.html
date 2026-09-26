@@ -159,6 +159,38 @@
     color: var(--muted);
     font-size: 13px;
   }
+  .stepper {
+    list-style: none;
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 6px;
+    margin: 0 0 8px;
+    padding: 0;
+  }
+  .stepper li {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 11px;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .stepper li span { font-weight: 600; }
+  .stepper li.active { background: var(--ink); border-color: var(--ink); color: #fff; }
+  .stepper li.done { border-color: var(--ink); color: var(--ink); }
+  .stepper li.done span { font-size: 0; }
+  .stepper li.done span::after { content: '✓'; font-size: 12px; }
+  .stage-caption {
+    margin: 0 0 14px;
+    min-height: 2.7em;
+    text-align: center;
+    font-size: 13px;
+    line-height: 1.35;
+    color: var(--muted);
+  }
   #canvasWrapper {
     display: flex;
     justify-content: center;
@@ -301,6 +333,14 @@
         <div class="status" id="statusLine">Generating…</div>
       </div>
 
+      <ol class="stepper" id="stepper">
+        <li><span>1</span> Prompt → vectors</li>
+        <li><span>2</span> Seed → noise</li>
+        <li><span>3</span> Denoise</li>
+        <li><span>4</span> Decode</li>
+      </ol>
+      <p class="stage-caption" id="stageCaption"></p>
+
       <div id="canvasWrapper">
         <canvas id="paintCanvas" width="600" height="400"></canvas>
       </div>
@@ -401,6 +441,24 @@
   const anotherBtn = document.getElementById('anotherBtn');
   const regenBtn = document.getElementById('regenBtn');
   const sourceLine = document.getElementById('sourceLine');
+  const stepperItems = Array.from(document.querySelectorAll('#stepper li'));
+  const stageCaption = document.getElementById('stageCaption');
+
+  const STAGE_CAPTIONS = [
+    'A text encoder turns your words into numbers (vectors) that capture their meaning. Real models use hundreds of numbers per word; we show 16.',
+    'The seed sets the starting point: pure random noise. The same seed and prompt always give the same image.',
+    'The model removes a little noise at each step, guided by your prompt vector. Rough shapes and colors form first, fine detail last.',
+    'A decoder (VAE) expands the small latent image into the full-resolution picture.',
+    'Done. The steps shown are an illustrative simulation; your actual image was generated on a remote server.',
+  ];
+
+  function setStage(n) {
+    stepperItems.forEach((li, i) => {
+      li.classList.toggle('done', i + 1 < n);
+      li.classList.toggle('active', i + 1 === n);
+    });
+    stageCaption.textContent = STAGE_CAPTIONS[clamp(n, 1, 5) - 1];
+  }
 
   let runId = 0;
   let lastPrompt = '';
@@ -443,6 +501,8 @@
     promptInput.value = '';
     promptInput.focus();
     downloadBtn.disabled = true;
+    submitBtn.disabled = false;
+    regenBtn.disabled = false;
   });
 
   regenBtn.addEventListener('click', () => {
@@ -530,6 +590,29 @@
     });
   }
 
+  // ---- Generation pipeline visualisation ---------------------------------
+  // The real image is generated on a remote server, so while we wait we play
+  // a small simulation of the four stages a diffusion model goes through.
+  // It never talks to the model; it only illustrates each stage.
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function hashString(s) {
+    let h = 2166136261 >>> 0;
+    for (let i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return h >>> 0;
+  }
+
   function hslToRgb(h, s, l) {
     s /= 100; l /= 100;
     const k = n => (n + h / 30) % 12;
@@ -538,144 +621,425 @@
     return { r: 255 * f(0), g: 255 * f(8), b: 255 * f(4) };
   }
 
-  function pickPalette(n) {
-    const baseHue = Math.random() * 360;
-    const colors = [];
+  function mixColor(a, b, t) {
+    return { r: a.r + (b.r - a.r) * t, g: a.g + (b.g - a.g) * t, b: a.b + (b.b - a.b) * t };
+  }
+
+  function tokenize(prompt) {
+    const words = prompt.toLowerCase().match(/[\p{L}\p{N}']+/gu) || [prompt.trim() || '…'];
+    if (words.length <= 8) return words;
+    return words.slice(0, 7).concat(['+' + (words.length - 7) + ' more']);
+  }
+
+  function embeddingFor(token) {
+    const rand = mulberry32(hashString(token));
+    const v = [];
+    for (let i = 0; i < 16; i++) v.push(rand() * 2 - 1);
+    return v;
+  }
+
+  function embColor(v, bright) {
+    const base = v < 0 ? { r: 70, g: 130, b: 255 } : { r: 255, g: 140, b: 60 };
+    const k = (0.15 + 0.85 * Math.abs(v)) * (bright == null ? 1 : bright);
+    return `rgb(${(base.r * k) | 0}, ${(base.g * k) | 0}, ${(base.b * k) | 0})`;
+  }
+
+  function roundRectPath(c, x, y, w, h, r) {
+    c.beginPath();
+    c.moveTo(x + r, y);
+    c.arcTo(x + w, y, x + w, y + h, r);
+    c.arcTo(x + w, y + h, x, y + h, r);
+    c.arcTo(x, y + h, x, y, r);
+    c.arcTo(x, y, x + w, y, r);
+    c.closePath();
+  }
+
+  // The "clean" latent the toy model is denoising toward: a gradient plus a
+  // few soft blobs, with colors derived from the prompt so each prompt looks
+  // different.
+  function makeCleanLatent(cols, rows, rand) {
+    const base = rand() * 360;
+    const pal = [0, 1, 2, 3].map(i =>
+      hslToRgb((base + i * (35 + rand() * 30)) % 360, 45 + rand() * 30, 38 + i * 8 + rand() * 8));
+    const aspect = cols / rows;
+    const blobs = [];
+    const n = 3 + Math.floor(rand() * 3);
     for (let i = 0; i < n; i++) {
-      const hue = (baseHue + (i * 360) / n + (Math.random() * 24 - 12) + 360) % 360;
-      colors.push(hslToRgb(hue, 55 + Math.random() * 30, 45 + Math.random() * 18));
+      blobs.push({ x: rand(), y: 0.15 + rand() * 0.7, r: 0.14 + rand() * 0.18, c: pal[2 + (i % 2)] });
     }
-    return colors;
-  }
-
-  // A tiny live "diffusion" simulation: a coarse grid of RGB cells that is
-  // continuously recomputed every frame (blurred toward its neighbors, pulled
-  // toward a slowly-drifting target color, and jittered with noise). That mix
-  // is what an actual diffusion model's denoising loop looks like — noise
-  // resolving into structure — so instead of faking discrete "steps" we just
-  // run the real thing at toy scale, live, while the real request is in flight.
-  function targetColorAt(palette, nx, ny, timeMs) {
-    const v = (
-      Math.sin(nx * 6 + timeMs * 0.00025) +
-      Math.sin(ny * 6 - timeMs * 0.00020) +
-      Math.sin((nx + ny) * 5 + timeMs * 0.00018) + 3
-    ) / 6;
-    const idx = Math.min(palette.length - 1, Math.max(0, Math.floor(v * palette.length)));
-    return palette[idx];
-  }
-
-  function makeDiffusionSim(w, h, palette) {
-    const cols = clamp(Math.round(w / 16), 20, 56);
-    const rows = Math.max(1, Math.round(cols * (h / w)));
-    const grid = new Array(cols * rows);
-    for (let i = 0; i < grid.length; i++) {
-      grid[i] = { r: Math.random() * 255, g: Math.random() * 255, b: Math.random() * 255 };
-    }
-    return { cols, rows, grid, palette };
-  }
-
-  function stepDiffusionSim(sim, noiseLevel, timeMs) {
-    const { cols, rows, grid, palette } = sim;
-    const next = new Array(grid.length);
+    const out = new Array(cols * rows);
     for (let y = 0; y < rows; y++) {
       for (let x = 0; x < cols; x++) {
-        let rs = 0, gs = 0, bs = 0, count = 0;
-        for (let dy = -1; dy <= 1; dy++) {
-          const ny = y + dy;
-          if (ny < 0 || ny >= rows) continue;
-          for (let dx = -1; dx <= 1; dx++) {
-            const nx = x + dx;
-            if (nx < 0 || nx >= cols) continue;
-            const c = grid[ny * cols + nx];
-            rs += c.r; gs += c.g; bs += c.b; count++;
+        const u = x / (cols - 1), v = y / (rows - 1);
+        let c = mixColor(pal[0], pal[1], v);
+        for (const b of blobs) {
+          const d = Math.hypot((u - b.x) * aspect, v - b.y) / b.r;
+          c = mixColor(c, b.c, Math.exp(-d * d) * 0.85);
+        }
+        out[y * cols + x] = c;
+      }
+    }
+    return out;
+  }
+
+  function boxBlur(grid, cols, rows, r) {
+    if (r <= 0) return grid;
+    const out = new Array(grid.length);
+    for (let y = 0; y < rows; y++) {
+      for (let x = 0; x < cols; x++) {
+        let rs = 0, gs = 0, bs = 0, n = 0;
+        for (let dy = -r; dy <= r; dy++) {
+          const yy = y + dy;
+          if (yy < 0 || yy >= rows) continue;
+          for (let dx = -r; dx <= r; dx++) {
+            const xx = x + dx;
+            if (xx < 0 || xx >= cols) continue;
+            const c = grid[yy * cols + xx];
+            rs += c.r; gs += c.g; bs += c.b; n++;
           }
         }
-        let r = rs / count, g = gs / count, b = bs / count;
-
-        const target = targetColorAt(palette, x / cols, y / rows, timeMs);
-        const pull = (1 - noiseLevel) * 0.06;
-        r = lerp(r, target.r, pull);
-        g = lerp(g, target.g, pull);
-        b = lerp(b, target.b, pull);
-
-        const jitter = noiseLevel * 55;
-        r = clamp(r + (Math.random() - 0.5) * jitter, 0, 255);
-        g = clamp(g + (Math.random() - 0.5) * jitter, 0, 255);
-        b = clamp(b + (Math.random() - 0.5) * jitter, 0, 255);
-
-        next[y * cols + x] = { r, g, b };
+        out[y * cols + x] = { r: rs / n, g: gs / n, b: bs / n };
       }
     }
-    sim.grid = next;
+    return out;
   }
 
-  function renderDiffusionSim(ctx, sim, w, h) {
-    const { cols, rows, grid } = sim;
-    const cw = w / cols, ch = h / rows;
-    for (let y = 0; y < rows; y++) {
-      for (let x = 0; x < cols; x++) {
-        const c = grid[y * cols + x];
-        ctx.fillStyle = `rgb(${c.r | 0}, ${c.g | 0}, ${c.b | 0})`;
-        ctx.fillRect(Math.floor(x * cw), Math.floor(y * ch), Math.ceil(cw), Math.ceil(ch));
-      }
+  // grids[k] is the latent after k denoising steps: the same fixed noise,
+  // fading out, over a structure that starts blurry and sharpens.
+  function buildDenoiseGrids(noise, clean, cols, rows, steps) {
+    const blurred = [0, 1, 2, 3].map(r => boxBlur(clean, cols, rows, r));
+    const grids = [], sigmas = [];
+    for (let k = 0; k <= steps; k++) {
+      const sigma = Math.pow(1 - k / steps, 1.5);
+      const b = blurred[Math.ceil(3 * (1 - k / steps))];
+      grids.push(noise.map((n, i) => ({
+        r: sigma * n.r + (1 - sigma) * b[i].r,
+        g: sigma * n.g + (1 - sigma) * b[i].g,
+        b: sigma * n.b + (1 - sigma) * b[i].b,
+      })));
+      sigmas.push(sigma);
     }
+    return { grids, sigmas };
   }
 
-  // Runs the live simulation for as long as the real request takes. Every
-  // ~5.5s it "restarts" (a fresh burst of noise, like trying a new sample)
-  // with a brief flash, so it reads as an ongoing process rather than
-  // something that finishes and idles if the network is slow.
-  function startGenAnimation(myRunId, w, h) {
+  const STAGE_LABELS = [
+    'Encoding your prompt…',
+    'Sampling noise from the seed…',
+    'Denoising…',
+    'Decoding latent → pixels…',
+  ];
+
+  function startGenAnimation(myRunId, w, h, info) {
     canvas.width = w;
     canvas.height = h;
     canvas.style.width = w + 'px';
     canvas.style.height = h + 'px';
     ctx.imageSmoothingEnabled = false;
 
-    const palette = pickPalette(6 + Math.floor(Math.random() * 3));
-    const sim = makeDiffusionSim(w, h, palette);
-    const passDuration = 5500;
-    const startTime = performance.now();
-    let raf;
-    let lastStepTime = 0;
-    const stepInterval = 1000 / 30;
+    const fs = clamp(Math.round(w * 0.03), 10, 13);
+    const S = { w, h, fs, pad: 12, headerH: Math.round(fs * 2.7), footerH: Math.round(fs * 2.7) };
+    S.mainY = S.headerH;
+    S.mainH = h - S.headerH - S.footerH;
+    S.cols = clamp(Math.round(w / 14), 22, 44);
+    S.rows = Math.max(4, Math.round(S.cols * S.mainH / w));
+    const font = (weight, px) => `${weight} ${px}px Inter, -apple-system, "Segoe UI", sans-serif`;
+
+    const tokens = tokenize(info.prompt);
+    const vecs = tokens.map(embeddingFor);
+    const pv = vecs[0].map((_, j) =>
+      clamp(vecs.reduce((s, v) => s + v[j], 0) / vecs.length * Math.sqrt(vecs.length), -1, 1));
+
+    const cells = S.cols * S.rows;
+    const noiseRand = mulberry32(info.seed);
+    const noise = Array.from({ length: cells }, () => ({ r: noiseRand() * 255, g: noiseRand() * 255, b: noiseRand() * 255 }));
+    const thRand = mulberry32(info.seed ^ 0x9e3779b9);
+    const thresh = Array.from({ length: cells }, () => thRand());
+
+    const N = 16;
+    const stepMs = 400;
+    const clean = makeCleanLatent(S.cols, S.rows, mulberry32(hashString(info.prompt)));
+    const { grids, sigmas } = buildDenoiseGrids(noise, clean, S.cols, S.rows, N);
+
+    const latentCanvas = document.createElement('canvas');
+    latentCanvas.width = S.cols;
+    latentCanvas.height = S.rows;
+    const lctx = latentCanvas.getContext('2d');
+    const imgData = lctx.createImageData(S.cols, S.rows);
+    grids[N].forEach((c, i) => {
+      imgData.data[i * 4] = c.r;
+      imgData.data[i * 4 + 1] = c.g;
+      imgData.data[i * 4 + 2] = c.b;
+      imgData.data[i * 4 + 3] = 255;
+    });
+    lctx.putImageData(imgData, 0, 0);
+
+    const D = [3200, 1800, N * stepMs, 1500];
+    const starts = [0, D[0], D[0] + D[1], D[0] + D[1] + D[2]];
+    const total = D[0] + D[1] + D[2] + D[3];
+    const latentW = Math.round(info.size.w / 8), latentH = Math.round(info.size.h / 8);
+
+    function header(title, right) {
+      ctx.fillStyle = '#0a0a0a';
+      ctx.fillRect(0, 0, w, S.headerH);
+      ctx.fillStyle = 'rgba(255,255,255,0.14)';
+      ctx.fillRect(0, S.headerH - 1, w, 1);
+      ctx.textBaseline = 'middle';
+      ctx.textAlign = 'left';
+      ctx.font = font(600, fs);
+      ctx.fillStyle = '#fff';
+      ctx.fillText(title, S.pad, S.headerH / 2);
+      ctx.textAlign = 'right';
+      ctx.font = font(500, fs);
+      ctx.fillStyle = 'rgba(255,255,255,0.7)';
+      ctx.fillText(right, w - S.pad, S.headerH / 2);
+    }
+
+    function footerGeom() {
+      ctx.font = font(500, fs - 1);
+      const labelW = ctx.measureText('prompt vector').width + S.pad * 2;
+      return { labelW, cw: (w - labelW - S.pad) / 16 };
+    }
+
+    function footer(brightness) {
+      const y0 = h - S.footerH;
+      ctx.fillStyle = '#0a0a0a';
+      ctx.fillRect(0, y0, w, S.footerH);
+      ctx.fillStyle = 'rgba(255,255,255,0.14)';
+      ctx.fillRect(0, y0, w, 1);
+      const g = footerGeom();
+      ctx.textBaseline = 'middle';
+      ctx.textAlign = 'left';
+      ctx.fillStyle = 'rgba(255,255,255,0.7)';
+      ctx.fillText('prompt vector', S.pad, y0 + S.footerH / 2);
+      for (let j = 0; j < 16; j++) {
+        ctx.fillStyle = embColor(pv[j], brightness);
+        ctx.fillRect(g.labelW + j * g.cw + 1, y0 + 6, g.cw - 2, S.footerH - 12);
+      }
+    }
+
+    function paintGrid(a, b, f, visible) {
+      const cw = w / S.cols, ch = S.mainH / S.rows;
+      for (let y = 0; y < S.rows; y++) {
+        for (let x = 0; x < S.cols; x++) {
+          const i = y * S.cols + x;
+          if (visible && !visible(i)) {
+            ctx.fillStyle = '#141414';
+          } else {
+            const c = b ? mixColor(a[i], b[i], f) : a[i];
+            ctx.fillStyle = `rgb(${c.r | 0}, ${c.g | 0}, ${c.b | 0})`;
+          }
+          ctx.fillRect(Math.floor(x * cw), Math.floor(S.mainY + y * ch), Math.ceil(cw), Math.ceil(ch));
+        }
+      }
+    }
+
+    function outlinedText(text, x, y) {
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = 'rgba(0,0,0,0.85)';
+      ctx.strokeText(text, x, y);
+      ctx.fillStyle = '#fff';
+      ctx.fillText(text, x, y);
+    }
+
+    // Stage 1: prompt -> tokens -> vectors
+    function drawEncoder(t) {
+      header('1 · Text encoder', tokens.length + (tokens.length === 1 ? ' token' : ' tokens'));
+      const n = tokens.length;
+      const top = S.headerH + 10, bottom = h - 8, mergeH = 46;
+      const rowH = Math.min(38, (bottom - mergeH - top) / n);
+      const chipH = Math.round(rowH * 0.74);
+      ctx.font = font(500, fs + 1);
+      const widths = tokens.map(tk => ctx.measureText(tk).width + 18);
+      const maxChip = Math.min(Math.max(...widths), w * 0.4);
+      const cellsX = S.pad + maxChip + 34;
+      const cw = Math.max(3, Math.min(rowH * 0.6, (w - cellsX - S.pad) / 16 - 2));
+      const slot = 0.7 / n;
+      ctx.textBaseline = 'middle';
+      ctx.textAlign = 'left';
+      for (let i = 0; i < n; i++) {
+        const tt = clamp((t - i * slot) / (slot * 1.8), 0, 1);
+        if (tt <= 0) continue;
+        const cy = top + i * rowH + rowH / 2;
+        ctx.globalAlpha = clamp(tt * 4, 0, 1);
+        roundRectPath(ctx, S.pad, cy - chipH / 2, Math.min(widths[i], maxChip), chipH, 5);
+        ctx.strokeStyle = 'rgba(255,255,255,0.7)';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+        ctx.fillStyle = '#fff';
+        ctx.font = font(500, fs + 1);
+        ctx.fillText(tokens[i], S.pad + 9, cy, maxChip - 14);
+        if (tt > 0.25) {
+          ctx.fillStyle = 'rgba(255,255,255,0.6)';
+          ctx.fillText('→', S.pad + maxChip + 10, cy);
+        }
+        ctx.globalAlpha = 1;
+        const filled = Math.floor(clamp((tt - 0.3) / 0.7, 0, 1) * 16);
+        for (let j = 0; j < filled; j++) {
+          ctx.fillStyle = embColor(vecs[i][j]);
+          ctx.fillRect(cellsX + j * (cw + 2), cy - cw / 2, cw, cw);
+        }
+      }
+      const mt = clamp((t - 0.78) / 0.22, 0, 1);
+      if (mt > 0) {
+        ctx.font = font(500, fs);
+        ctx.fillStyle = `rgba(255,255,255,${(0.4 + 0.4 * mt).toFixed(2)})`;
+        ctx.fillText('↓ combined into one prompt vector', S.pad, bottom - mergeH + 10);
+        const big = clamp((w - 2 * S.pad) / 16 - 2, 4, 24);
+        const filled = Math.floor(mt * 16);
+        for (let j = 0; j < filled; j++) {
+          ctx.fillStyle = embColor(pv[j]);
+          ctx.fillRect(S.pad + j * (big + 2), bottom - 26, big, 22);
+        }
+      }
+    }
+
+    // Stage 2: the seed fixes the starting noise
+    function drawNoise(t) {
+      header('2 · Random noise', 'seed ' + info.seed);
+      const f = easeInOutCubic(t);
+      paintGrid(noise, null, 0, i => thresh[i] <= f);
+      footer(1);
+    }
+
+    // Stage 3: remove a little noise per step, guided by the prompt vector
+    function drawDenoise(localMs) {
+      const k = Math.min(N - 1, Math.floor(localMs / stepMs));
+      const frac = clamp((localMs - k * stepMs) / stepMs, 0, 1);
+      const f = easeInOutCubic(frac);
+      paintGrid(grids[k], grids[k + 1], f);
+
+      const iw = Math.round(w * 0.26);
+      const ih = Math.max(8, Math.round(iw * S.mainH / w));
+      const ix = w - iw - 8, iy = S.mainY + 8;
+      ctx.fillStyle = '#000';
+      ctx.fillRect(ix - 1, iy - 1, iw + 2, ih + 2);
+      const icw = iw / S.cols, ich = ih / S.rows;
+      for (let y = 0; y < S.rows; y++) {
+        for (let x = 0; x < S.cols; x++) {
+          const i = y * S.cols + x;
+          const a = grids[k][i], b = grids[k + 1][i];
+          const d = (Math.abs(a.r - b.r) + Math.abs(a.g - b.g) + Math.abs(a.b - b.b)) / 3;
+          const g = clamp(d * 3.2, 0, 255) | 0;
+          ctx.fillStyle = `rgb(${g}, ${g}, ${g})`;
+          ctx.fillRect(Math.floor(ix + x * icw), Math.floor(iy + y * ich), Math.ceil(icw), Math.ceil(ich));
+        }
+      }
+      ctx.strokeStyle = 'rgba(255,255,255,0.8)';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(ix - 0.5, iy - 0.5, iw + 1, ih + 1);
+      ctx.font = font(600, fs - 1);
+      ctx.textBaseline = 'middle';
+      ctx.textAlign = 'right';
+      outlinedText('predicted noise (removed this step)', w - 8, iy + ih + fs);
+
+      const g = footerGeom();
+      const fy = h - S.footerH;
+      const rr = mulberry32(hashString('guide' + k));
+      ctx.lineWidth = 1;
+      for (let j = 0; j < 6; j++) {
+        const ci = Math.floor(rr() * 16);
+        ctx.strokeStyle = `rgba(255,255,255,${(0.4 * (1 - frac)).toFixed(3)})`;
+        ctx.beginPath();
+        ctx.moveTo(g.labelW + ci * g.cw + g.cw / 2, fy + 4);
+        ctx.lineTo(rr() * w, S.mainY + rr() * S.mainH);
+        ctx.stroke();
+      }
+
+      const sig = sigmas[k] + (sigmas[k + 1] - sigmas[k]) * f;
+      header('3 · Denoising', `Step ${k + 1} / ${N} · noise ${Math.round(sig * 100)}%`);
+      footer(0.55 + 0.45 * (1 - frac));
+      const label = `Denoising · step ${k + 1} of ${N}`;
+      if (progressText.textContent !== label) progressText.textContent = label;
+    }
+
+    // Stage 4: decoder expands the small latent to full resolution
+    function drawDecode(t, hold, timeMs) {
+      const sy = S.mainY + easeInOutCubic(t) * S.mainH;
+      paintGrid(grids[N], null, 0);
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(0, S.mainY, w, sy - S.mainY);
+      ctx.clip();
+      ctx.imageSmoothingEnabled = true;
+      ctx.drawImage(latentCanvas, 0, 0, S.cols, S.rows, 0, S.mainY, w, S.mainH);
+      ctx.restore();
+      ctx.imageSmoothingEnabled = false;
+      if (!hold) {
+        ctx.fillStyle = 'rgba(255,255,255,0.25)';
+        ctx.fillRect(0, sy - 8, w, 8);
+        ctx.fillStyle = '#fff';
+        ctx.fillRect(0, sy - 1, w, 2);
+      } else {
+        const by = S.mainY + ((timeMs % 2400) / 2400) * S.mainH;
+        ctx.fillStyle = 'rgba(255,255,255,0.12)';
+        ctx.fillRect(0, by - 10, w, 20);
+      }
+      const dots = '.'.repeat(1 + (Math.floor(timeMs / 400) % 3));
+      header('4 · Decoder (VAE)', hold ? 'waiting for the server' + dots : `${latentW}×${latentH} → ${info.size.w}×${info.size.h}`);
+      footer(0.55);
+    }
+
+    let vt = 0, last = null, speed = 1, lastStage = -1, cancelled = false;
+    let finishRequested = false, finishResolve = null, raf;
 
     function frame(now) {
-      if (myRunId !== runId) return;
-      const timeMs = now - startTime;
-      const cyclePos = (timeMs % passDuration) / passDuration;
-      const noiseLevel = clamp(1 - cyclePos * 0.93, 0.07, 1);
-
-      if (now - lastStepTime >= stepInterval) {
-        if (cyclePos < 0.015 && lastStepTime > 0) {
-          // fresh burst of noise at the start of each pass
-          for (let i = 0; i < sim.grid.length; i++) {
-            sim.grid[i] = { r: Math.random() * 255, g: Math.random() * 255, b: Math.random() * 255 };
-          }
-        }
-        stepDiffusionSim(sim, noiseLevel, timeMs);
-        lastStepTime = now;
+      if (cancelled) return;
+      if (myRunId !== runId) {
+        cancelled = true;
+        if (finishResolve) { const r = finishResolve; finishResolve = null; r(); }
+        return;
       }
-      renderDiffusionSim(ctx, sim, w, h);
+      if (last === null) last = now;
+      const dt = Math.min(now - last, 60);
+      last = now;
+      vt = Math.min(total, vt + dt * speed);
+      const hold = vt >= total;
 
-      if (cyclePos < 0.06) {
-        const flashAlpha = ((0.06 - cyclePos) / 0.06) * 0.3;
-        ctx.fillStyle = `rgba(255,255,255,${flashAlpha.toFixed(2)})`;
-        ctx.fillRect(0, 0, w, h);
+      let stage = 3;
+      for (let i = 0; i < 4; i++) {
+        if (vt < starts[i] + D[i]) { stage = i; break; }
+      }
+      const localMs = vt - starts[stage];
+      const t = clamp(localMs / D[stage], 0, 1);
+      if (stage !== lastStage) {
+        lastStage = stage;
+        setStage(stage + 1);
+        progressText.textContent = STAGE_LABELS[stage];
       }
 
-      let label;
-      if (cyclePos < 0.06) label = 'Sampling a fresh idea…';
-      else if (noiseLevel > 0.7) label = 'Exploring rough shapes…';
-      else if (noiseLevel > 0.4) label = 'Composing the scene…';
-      else if (noiseLevel > 0.18) label = 'Refining details…';
-      else label = 'Polishing pixels…';
-      progressText.textContent = label;
+      ctx.imageSmoothingEnabled = false;
+      ctx.fillStyle = '#0a0a0a';
+      ctx.fillRect(0, 0, w, h);
+      if (stage === 0) drawEncoder(t);
+      else if (stage === 1) drawNoise(t);
+      else if (stage === 2) drawDenoise(localMs);
+      else drawDecode(t, hold, now);
+      setProgress(vt / total * 0.5);
 
+      if (finishRequested && hold && finishResolve) {
+        const r = finishResolve;
+        finishResolve = null;
+        r();
+      }
       raf = requestAnimationFrame(frame);
     }
     raf = requestAnimationFrame(frame);
-    return () => cancelAnimationFrame(raf);
+
+    return {
+      cancel() {
+        cancelled = true;
+        cancelAnimationFrame(raf);
+        if (finishResolve) { const r = finishResolve; finishResolve = null; r(); }
+      },
+      // The real image is ready: fast-forward through whatever is left.
+      finish() {
+        return new Promise(resolve => {
+          finishResolve = resolve;
+          finishRequested = true;
+          speed = 2.5;
+        });
+      },
+    };
   }
 
   async function startGeneration(prompt, isRegen) {
@@ -694,24 +1058,25 @@
     genScreen.classList.remove('hidden');
     downloadBtn.disabled = true;
     promptTitleEl.textContent = '"' + prompt + '"';
-    statusLine.textContent = 'The AI is generating your image…';
+    statusLine.textContent = 'Watching the generation steps…';
     setProgress(0, 'Contacting the AI…');
-    sourceLine.innerHTML = 'Powered by <a href="https://pollinations.ai" target="_blank" rel="noopener">Pollinations.ai</a>';
+    setStage(1);
+    sourceLine.innerHTML = 'Powered by <a href="https://pollinations.ai" target="_blank" rel="noopener">Pollinations.ai</a> · the steps shown are an illustrative simulation while the real image is generated remotely';
 
     // Fit the preview canvas to the target image's aspect ratio.
     const maxW = Math.min(900, canvasWrapper.clientWidth || 860, window.innerWidth - 60);
-    const maxH = Math.min(680, window.innerHeight * 0.62);
+    const maxH = Math.max(320, Math.min(680, window.innerHeight * 0.62));
     const scale = Math.min(maxW / size.w, maxH / size.h, 1);
     const previewW = Math.max(1, Math.round(size.w * scale));
     const previewH = Math.max(1, Math.round(size.h * scale));
 
-    const stopGenAnim = startGenAnimation(myRunId, previewW, previewH);
+    const gen = startGenAnimation(myRunId, previewW, previewH, { prompt, seed, size });
 
     let img;
     try {
       img = await loadImage(url, 90000);
     } catch (err) {
-      stopGenAnim();
+      gen.cancel();
       if (myRunId === runId) {
         showError(
           err.message === 'timeout'
@@ -726,7 +1091,8 @@
       return;
     }
 
-    stopGenAnim();
+    await gen.finish();
+    gen.cancel();
     if (myRunId !== runId) return;
 
     submitBtn.disabled = false;
@@ -736,13 +1102,14 @@
     await paint(img, myRunId);
     if (myRunId === runId) {
       statusLine.textContent = 'Done!';
+      setStage(5);
       downloadBtn.disabled = false;
     }
   }
 
   async function paint(img, myRunId) {
     const maxW = Math.min(900, canvasWrapper.clientWidth || 860, window.innerWidth - 60);
-    const maxH = Math.min(680, window.innerHeight * 0.62);
+    const maxH = Math.max(320, Math.min(680, window.innerHeight * 0.62));
     const scale = Math.min(maxW / img.naturalWidth, maxH / img.naturalHeight, 1);
     const w = Math.max(1, Math.round(img.naturalWidth * scale));
     const h = Math.max(1, Math.round(img.naturalHeight * scale));
@@ -771,7 +1138,8 @@
     const tmp = document.createElement('canvas');
     const tctx = tmp.getContext('2d');
 
-    setProgress(0, 'Sketching composition…');
+    setStage(4);
+    setProgress(0.5, 'Decoding to full resolution…');
 
     // Phase 1: coarse-to-fine blocky pass
     await new Promise(resolve => {
@@ -790,7 +1158,7 @@
         ctx.imageSmoothingEnabled = false;
         ctx.drawImage(tmp, 0, 0, gridW, gridH, 0, 0, w, h);
 
-        setProgress(t * 0.45, 'Sketching composition…');
+        setProgress(0.5 + t * 0.25, 'Decoding to full resolution…');
         if (t < 1) requestAnimationFrame(frame); else resolve();
       }
       requestAnimationFrame(frame);
@@ -823,7 +1191,7 @@
           ctx.drawImage(fullCanvas, x, y, cw, ch, x, y, cw, ch);
           revealed++;
         }
-        setProgress(0.45 + t * 0.55, 'Adding pixel detail…');
+        setProgress(0.75 + t * 0.25, 'Adding pixel detail…');
         if (t < 1) requestAnimationFrame(frame); else resolve();
       }
       requestAnimationFrame(frame);
